@@ -1,6 +1,5 @@
 bl_info = {
     "name": "Texture Maker",
-    "author": "OpenAI",
     "version": (1, 23, 1),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Texture Maker",
