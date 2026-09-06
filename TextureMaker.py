@@ -1,6 +1,7 @@
 bl_info = {
     "name": "Texture Maker",
-    "version": (1, 23, 1),
+    "author": "OpenAI",
+    "version": (1, 24, 0),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Texture Maker",
     "description": "Material layer stack with individual texture baking",
@@ -155,6 +156,7 @@ TM_MAPPING_ITEMS = [
 TM_SHADER_ITEMS = [
     ('PRINCIPLED', "Principled", "Standard physically based shader"),
     ('UNLIT', "Unlit", "Display the layer stack without scene lighting"),
+    ('EMISSIVE', "Emissive", "Emit the layer stack with adjustable intensity"),
     ('GLOSSY', "Glossy", "Reflective glossy surface shader"),
     ('GLASS', "Glass", "Transparent refractive glass shader"),
 ]
@@ -1719,6 +1721,12 @@ def create_material_shader_nodes(
         shader_node.name = "TM Unlit Emission"
         shader_node.label = "Unlit"
         shader_node.inputs["Strength"].default_value = 1.0
+        links.new(color_socket, shader_node.inputs["Color"])
+    elif shader_type == 'EMISSIVE':
+        shader_node = nodes.new("ShaderNodeEmission")
+        shader_node.name = "TM Emissive Shader"
+        shader_node.label = "Emissive"
+        shader_node.inputs["Strength"].default_value = settings.emission_strength
         links.new(color_socket, shader_node.inputs["Color"])
     elif shader_type == 'GLOSSY':
         shader_node = nodes.new("ShaderNodeBsdfGlossy")
@@ -3673,28 +3681,64 @@ def configure_bake_type(scene, layer_type):
     return layer_type
 
 
-def create_temp_bake_nodes(obj, image, excluded_materials=()):
+def tm_object_used_materials(obj, excluded_materials=()):
+    """Return each material referenced by at least one polygon, in slot order."""
+    excluded_materials = set(excluded_materials)
+    used_slot_indices = sorted({polygon.material_index for polygon in obj.data.polygons})
+    materials = []
+    missing_slots = []
+    for slot_index in used_slot_indices:
+        material = (
+            obj.material_slots[slot_index].material
+            if slot_index < len(obj.material_slots)
+            else None
+        )
+        if material is None:
+            missing_slots.append(str(slot_index + 1))
+        elif material not in excluded_materials and material not in materials:
+            materials.append(material)
+    if missing_slots:
+        raise RuntimeError(
+            "Faces use empty material slots: " + ", ".join(missing_slots)
+        )
+    return materials
+
+
+def create_temp_bake_nodes(
+    obj,
+    image,
+    excluded_materials=(),
+    materials=None,
+):
     temp_nodes = []
     active_nodes = {}
-    materials = []
     excluded_materials = set(excluded_materials)
-    for slot in obj.material_slots:
-        material = slot.material
+    material_source = (
+        materials
+        if materials is not None
+        else (slot.material for slot in obj.material_slots)
+    )
+    visited_materials = []
+    for material in material_source:
         if (
             not material
-            or material in materials
+            or material in visited_materials
             or material in excluded_materials
         ):
             continue
-        materials.append(material)
+        visited_materials.append(material)
         material.use_nodes = True
         nodes = material.node_tree.nodes
         active_nodes[material] = nodes.active
+        for existing_node in nodes:
+            existing_node.select = False
         node = nodes.new("ShaderNodeTexImage")
         node.name = "__TM_TEMP_BAKE_TARGET__"
         node.image = image
         node.select = True
         nodes.active = node
+        material.node_tree.update_tag()
+        material.update_tag()
         temp_nodes.append((material, node))
     return temp_nodes, active_nodes
 
@@ -3784,8 +3828,63 @@ def tm_find_material_principled_input(material, input_name):
     return shader.inputs.get(input_name) if shader else None
 
 
+def tm_find_material_albedo_input(material):
+    """Find the visible base-color input without depending on shader lighting."""
+    if not material or not material.use_nodes or not material.node_tree:
+        return None
+    nodes = material.node_tree.nodes
+    for node_name, input_name in (
+        ("TM Principled BSDF", "Base Color"),
+        ("TM Unlit Emission", "Color"),
+        ("TM Emissive Shader", "Color"),
+        ("TM Glossy BSDF", "Color"),
+        ("TM Glass BSDF", "Color"),
+    ):
+        node = nodes.get(node_name)
+        if node and node.inputs.get(input_name):
+            return node.inputs[input_name]
+
+    output = next(
+        (
+            node
+            for node in nodes
+            if node.bl_idname == "ShaderNodeOutputMaterial"
+            and node.is_active_output
+        ),
+        None,
+    )
+    shader = None
+    if output and output.inputs["Surface"].is_linked:
+        shader = output.inputs["Surface"].links[0].from_node
+        if shader.bl_idname == "ShaderNodeMixShader":
+            # Texture Maker uses the second shader input for its visible
+            # surface and the first for transparency.
+            visible_input = shader.inputs[2]
+            if visible_input.is_linked:
+                shader = visible_input.links[0].from_node
+
+    input_names = {
+        "ShaderNodeBsdfPrincipled": "Base Color",
+        "ShaderNodeEmission": "Color",
+        "ShaderNodeBsdfDiffuse": "Color",
+        "ShaderNodeBsdfGlossy": "Color",
+        "ShaderNodeBsdfGlass": "Color",
+    }
+    if shader and shader.bl_idname in input_names:
+        return shader.inputs.get(input_names[shader.bl_idname])
+
+    for node_type, input_name in input_names.items():
+        shader = next((node for node in nodes if node.bl_idname == node_type), None)
+        if shader:
+            return shader.inputs.get(input_name)
+    return None
+
+
 def tm_data_channel_source(material, channel):
-    if channel == 'ALPHA':
+    if channel == 'ALBEDO':
+        input_socket = tm_find_material_albedo_input(material)
+        default_value = tuple(material.diffuse_color)
+    elif channel == 'ALPHA':
         input_socket = tm_find_material_alpha_input(material)
         default_value = 1.0
     elif channel == 'METALNESS':
@@ -3802,7 +3901,12 @@ def tm_data_channel_source(material, channel):
     if input_socket and input_socket.is_linked:
         return input_socket.links[0].from_socket, default_value
     if input_socket:
-        return None, float(input_socket.default_value)
+        socket_default = input_socket.default_value
+        try:
+            socket_default = tuple(socket_default)
+        except TypeError:
+            socket_default = float(socket_default)
+        return None, socket_default
     return None, default_value
 
 
@@ -3811,15 +3915,24 @@ def tm_create_data_channel_bake_overrides(
     image,
     channel,
     excluded_materials=(),
+    materials=None,
 ):
     records = []
-    materials = []
     excluded_materials = set(excluded_materials)
-    for slot in obj.material_slots:
-        material = slot.material
-        if not material or material in materials or material in excluded_materials:
+    material_source = (
+        materials
+        if materials is not None
+        else (slot.material for slot in obj.material_slots)
+    )
+    visited_materials = []
+    for material in material_source:
+        if (
+            not material
+            or material in visited_materials
+            or material in excluded_materials
+        ):
             continue
-        materials.append(material)
+        visited_materials.append(material)
         material.use_nodes = True
         nodes = material.node_tree.nodes
         links = material.node_tree.links
@@ -3846,6 +3959,8 @@ def tm_create_data_channel_bake_overrides(
         target.image = image
         target.select = True
         nodes.active = target
+        material.node_tree.update_tag()
+        material.update_tag()
 
         emission = nodes.new("ShaderNodeEmission")
         emission.name = f"__TM_{channel}_EMISSION__"
@@ -3854,12 +3969,18 @@ def tm_create_data_channel_bake_overrides(
         if source_socket:
             links.new(source_socket, emission.inputs["Color"])
         else:
-            emission.inputs["Color"].default_value = (
-                default_value,
-                default_value,
-                default_value,
-                1.0,
-            )
+            if isinstance(default_value, tuple):
+                color = tuple(default_value[:4])
+                if len(color) == 3:
+                    color = (*color, 1.0)
+            else:
+                color = (
+                    default_value,
+                    default_value,
+                    default_value,
+                    1.0,
+                )
+            emission.inputs["Color"].default_value = color
         links.new(emission.outputs["Emission"], output.inputs["Surface"])
         records.append(
             (
@@ -4649,6 +4770,15 @@ class TM_MaterialSettings(bpy.types.PropertyGroup):
         default='PRINCIPLED',
         update=update_material_shader,
     )
+    emission_strength: bpy.props.FloatProperty(
+        name="Emission Strength",
+        description="Light intensity emitted by the Emissive shader",
+        default=1.0,
+        min=0.0,
+        soft_max=10.0,
+        max=1000.0,
+        update=update_material_shader,
+    )
     layers: bpy.props.CollectionProperty(type=TM_Layer)
     layer_index: bpy.props.IntProperty(
         default=0,
@@ -5360,11 +5490,14 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
                 )
                 return {'CANCELLED'}
 
-        source_materials = {
-            slot.material
-            for slot in obj.material_slots
-            if slot.material and slot.material != output_material
-        }
+        try:
+            source_materials = tm_object_used_materials(
+                obj,
+                excluded_materials={output_material},
+            )
+        except RuntimeError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
         if not source_materials:
             self.report({'ERROR'}, "The object has no source materials to bake")
             return {'CANCELLED'}
@@ -5386,6 +5519,9 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
         previous_engine = context.scene.render.engine
         previous_mode = obj.mode
         previous_uv = obj.data.uv_layers.active
+        previous_active_material_index = obj.active_material_index
+        previous_selected_objects = list(context.selected_objects)
+        previous_active_object = context.view_layer.objects.active
         previous_samples = getattr(context.scene.cycles, "samples", None)
         bake = context.scene.render.bake
         previous_bake = {
@@ -5403,6 +5539,7 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
         try:
             if previous_mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
+            tm_select_only_object(context, obj)
             obj.data.uv_layers.active = uv_layer
             uv_layer.active_render = True
             context.scene.render.engine = 'CYCLES'
@@ -5424,14 +5561,20 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
                 )
                 tm_clear_image(image)
                 try:
-                    if channel in {'HEIGHT', 'METALNESS', 'ALPHA'}:
+                    if channel in {'ALBEDO', 'HEIGHT', 'METALNESS', 'ALPHA'}:
                         override_records = tm_create_data_channel_bake_overrides(
                             obj,
                             image,
                             channel,
                             excluded_materials={output_material},
                         )
-                        if len(override_records) != len(source_materials):
+                        prepared_materials = {
+                            record[0] for record in override_records
+                        }
+                        if any(
+                            material not in prepared_materials
+                            for material in source_materials
+                        ):
                             raise RuntimeError(
                                 "Every source material must use nodes before it can be baked"
                             )
@@ -5442,12 +5585,17 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
                             image,
                             excluded_materials={output_material},
                         )
-                        if len(temp_nodes) != len(source_materials):
+                        prepared_materials = {
+                            material for material, _node in temp_nodes
+                        }
+                        if any(
+                            material not in prepared_materials
+                            for material in source_materials
+                        ):
                             raise RuntimeError(
                                 "Every source material must use nodes before it can be baked"
                             )
                         bake_type = {
-                            'ALBEDO': 'DIFFUSE',
                             'NORMAL': 'NORMAL',
                             'AO': 'AO',
                             'ROUGHNESS': 'ROUGHNESS',
@@ -5456,13 +5604,16 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
 
                     bake.use_pass_direct = False
                     bake.use_pass_indirect = False
-                    bake.use_pass_color = channel == 'ALBEDO'
+                    bake.use_pass_color = False
                     if channel == 'NORMAL':
                         try:
                             bake.normal_space = 'TANGENT'
                         except Exception:
                             pass
-                    bpy.ops.object.bake(type=bake_type)
+                    bpy.ops.object.bake(
+                        type=bake_type,
+                        uv_layer=settings.uv_map,
+                    )
                     image.pack()
                     images[channel] = image
                 finally:
@@ -5483,7 +5634,10 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
             )
             self.report(
                 {'INFO'},
-                f"Baked '{obj.name}' channels: {channel_labels}",
+                (
+                    f"Baked '{obj.name}' from {len(source_materials)} material(s): "
+                    f"{channel_labels}"
+                ),
             )
             return {'FINISHED'}
         except Exception as error:
@@ -5501,9 +5655,15 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
             if previous_samples is not None:
                 context.scene.cycles.samples = previous_samples
             context.scene.render.engine = previous_engine
+            obj.active_material_index = previous_active_material_index
             if previous_uv:
                 obj.data.uv_layers.active = previous_uv
                 previous_uv.active_render = True
+            tm_restore_object_selection(
+                context,
+                previous_selected_objects,
+                previous_active_object,
+            )
             if previous_mode != 'OBJECT':
                 try:
                     bpy.ops.object.mode_set(mode=previous_mode)
@@ -5614,6 +5774,8 @@ class TM_PT_panel(bpy.types.Panel):
             )
             if settings.show_shader_settings:
                 shader_box.prop(settings, "shader_type")
+                if settings.shader_type == 'EMISSIVE':
+                    shader_box.prop(settings, "emission_strength")
 
             output_box = layout.box()
             output_box.label(text="Bake Settings")
