@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Texture Maker",
     "author": "OpenAI",
-    "version": (1, 24, 0),
+    "version": (1, 24, 1),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Texture Maker",
     "description": "Material layer stack with individual texture baking",
@@ -674,6 +674,27 @@ def create_layer_image_sample_nodes(
     return accumulated_color_socket, accumulated_alpha_socket
 
 
+def multiply_color_ramp_alpha(
+    nodes,
+    links,
+    source_alpha_socket,
+    ramp_alpha_socket,
+    node_name,
+    location,
+    frame,
+):
+    """Apply ramp transparency without discarding painted image coverage."""
+    alpha_node = nodes.new("ShaderNodeMath")
+    alpha_node.operation = 'MULTIPLY'
+    alpha_node.use_clamp = True
+    alpha_node.name = node_name
+    alpha_node.location = location
+    alpha_node.parent = frame
+    links.new(source_alpha_socket, alpha_node.inputs[0])
+    links.new(ramp_alpha_socket, alpha_node.inputs[1])
+    return alpha_node.outputs[0]
+
+
 def create_mask_factor_nodes(
     nodes,
     links,
@@ -742,7 +763,17 @@ def create_mask_factor_nodes(
             else:
                 links.new(mask_alpha_socket, group_node.inputs["Fac"])
             mask_color_socket = group_node.outputs["Color"]
-            if layer.layer_type not in TM_LUMINANCE_COLOR_RAMP_TYPES:
+            if layer.layer_type in TM_LUMINANCE_COLOR_RAMP_TYPES:
+                mask_alpha_socket = multiply_color_ramp_alpha(
+                    nodes,
+                    links,
+                    mask_alpha_socket,
+                    group_node.outputs["Alpha"],
+                    f"TM Mask Ramp Alpha {layer_number + 1}",
+                    (x_position + 560.0, y_position - 220.0),
+                    frame,
+                )
+            else:
                 mask_alpha_socket = group_node.outputs["Alpha"]
 
     luminance_node = nodes.new("ShaderNodeRGBToBW")
@@ -922,7 +953,17 @@ def create_mix_layer_nodes(
             else:
                 links.new(layer_alpha_socket, group_node.inputs["Fac"])
             layer_color_socket = group_node.outputs["Color"]
-            if layer.layer_type not in TM_LUMINANCE_COLOR_RAMP_TYPES:
+            if layer.layer_type in TM_LUMINANCE_COLOR_RAMP_TYPES:
+                layer_alpha_socket = multiply_color_ramp_alpha(
+                    nodes,
+                    links,
+                    layer_alpha_socket,
+                    group_node.outputs["Alpha"],
+                    f"TM Ramp Alpha {layer_number + 1}",
+                    (x_position + 560.0, -220.0),
+                    frame,
+                )
+            else:
                 layer_alpha_socket = group_node.outputs["Alpha"]
 
     alpha_node = nodes.new("ShaderNodeMath")
