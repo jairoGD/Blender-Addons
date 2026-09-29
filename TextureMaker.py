@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Texture Maker",
     "author": "OpenAI",
-    "version": (1, 24, 1),
+    "version": (1, 24, 5),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Texture Maker",
     "description": "Material layer stack with individual texture baking",
@@ -69,6 +69,7 @@ TM_OBJECT_BAKE_CHANNELS = (
     ('ALBEDO', "Albedo", "bake_albedo", "output_image"),
     ('NORMAL', "Normal Map", "bake_normal", "output_normal_image"),
     ('HEIGHT', "Height", "bake_height", "output_height_image"),
+    ('WEIGHT', "Weight Map", "bake_weight", "output_weight_image"),
     ('AO', "Ambient Occlusion", "bake_ao", "output_ao_image"),
     ('ROUGHNESS', "Roughness", "bake_roughness", "output_roughness_image"),
     ('METALNESS', "Metalness", "bake_metalness", "output_metalness_image"),
@@ -83,6 +84,7 @@ TM_BLEND_LABELS = {
 
 TM_LAYER_TYPE_ITEMS = [
     ('ALBEDO', "Albedo", "Bake material base color"),
+    ('HEIGHT', "Height", "Create a paintable elevation and depth layer"),
     ('AO', "Ambient Occlusion", "Bake ambient occlusion"),
     ('NORMAL', "Normal", "Bake tangent-space normals"),
     ('SHADOW', "Shadow / Light Mask", "Bake scene lighting and shadows"),
@@ -118,6 +120,7 @@ TM_EDGE_MARKER_ATTRIBUTES = {
 
 TM_LAYER_ICONS = {
     'ALBEDO': 'MATERIAL',
+    'HEIGHT': 'MOD_DISPLACE',
     'AO': 'SHADING_RENDERED',
     'NORMAL': 'NORMALS_FACE',
     'SHADOW': 'LIGHT',
@@ -329,6 +332,17 @@ def update_material_from_layer(layer, context):
     material = find_layer_material(layer)
     if material and material.tm_settings.initialized:
         rebuild_texture_material(material)
+
+
+def update_layer_type(layer, context):
+    if _TM_REBUILDING:
+        return
+    if layer.layer_type == 'HEIGHT' and layer.blend_mode != 'HEIGHT':
+        # Height is the initial use of this source, but the user may choose any
+        # other blend mode afterward to use its generated black/white texture.
+        layer.blend_mode = 'HEIGHT'
+        return
+    update_material_from_layer(layer, context)
 
 
 def update_material_shader(settings, context):
@@ -966,6 +980,21 @@ def create_mix_layer_nodes(
             else:
                 layer_alpha_socket = group_node.outputs["Alpha"]
 
+    if layer.layer_type == 'HEIGHT' and layer.blend_mode == 'HEIGHT':
+        luminance = nodes.new("ShaderNodeRGBToBW")
+        luminance.name = f"TM Height Color Mask {layer_number + 1}"
+        luminance.location = (x_position + 300.0, -220.0)
+        luminance.parent = frame
+        links.new(layer_color_socket, luminance.inputs["Color"])
+        coverage = nodes.new("ShaderNodeMath")
+        coverage.operation = 'MULTIPLY'
+        coverage.name = f"TM Height Color Coverage {layer_number + 1}"
+        coverage.location = (x_position + 360.0, -300.0)
+        coverage.parent = frame
+        links.new(luminance.outputs[0], coverage.inputs[0])
+        links.new(layer_alpha_socket, coverage.inputs[1])
+        layer_alpha_socket = coverage.outputs[0]
+
     alpha_node = nodes.new("ShaderNodeMath")
     alpha_node.operation = 'MULTIPLY'
     alpha_node.name = f"TM Alpha {layer_number + 1}"
@@ -973,6 +1002,9 @@ def create_mix_layer_nodes(
     alpha_node.location = (x_position + 380.0, -80.0)
     alpha_node.parent = frame
     links.new(layer_alpha_socket, alpha_node.inputs[0])
+
+    if layer.layer_type == 'HEIGHT' and layer.blend_mode == 'HEIGHT':
+        return base_color_socket, base_alpha_socket
 
     return composite_layer_sockets(
         nodes,
@@ -1471,9 +1503,24 @@ def create_surface_layer_nodes(
             has_height,
         )
 
-    # Height is a paint mask stored independently in alpha. RGB can therefore
-    # contain any paint color without changing relief intensity or direction.
-    height_socket = source_alpha_socket
+    # Dedicated Height textures store the mask in RGB so they can also be used
+    # by regular color blend modes. Other sources keep the paint mask in alpha.
+    if layer.layer_type == 'HEIGHT':
+        luminance = nodes.new("ShaderNodeRGBToBW")
+        luminance.name = f"TM Height Luminance {layer_number + 1}"
+        luminance.location = (x_position + 660.0, -1080.0)
+        luminance.parent = frame
+        links.new(color_socket, luminance.inputs["Color"])
+        covered_luminance = nodes.new("ShaderNodeMath")
+        covered_luminance.operation = 'MULTIPLY'
+        covered_luminance.name = f"TM Height Coverage {layer_number + 1}"
+        covered_luminance.location = (x_position + 760.0, -1080.0)
+        covered_luminance.parent = frame
+        links.new(luminance.outputs[0], covered_luminance.inputs[0])
+        links.new(source_alpha_socket, covered_luminance.inputs[1])
+        height_socket = covered_luminance.outputs[0]
+    else:
+        height_socket = source_alpha_socket
 
     opacity_node = nodes.new("ShaderNodeMath")
     opacity_node.operation = 'MULTIPLY'
@@ -1745,6 +1792,22 @@ def create_height_bake_output_node(nodes, links, height_channel_socket, x_positi
     return output.outputs[0]
 
 
+def create_weight_bake_output_node(nodes, links, height_channel_socket, x_position):
+    """Expose raised Height as white and neutral/depth as black."""
+    if height_channel_socket is None:
+        output = nodes.new("ShaderNodeValue")
+        output.outputs[0].default_value = 0.0
+    else:
+        output = nodes.new("ShaderNodeMath")
+        output.operation = 'GREATER_THAN'
+        output.inputs[1].default_value = 0.0
+        links.new(height_channel_socket, output.inputs[0])
+    output.name = "TM Weight Bake Output"
+    output.label = "Weight Bake: Elevation Mask"
+    output.location = (x_position, -1400.0)
+    return output.outputs[0]
+
+
 def create_material_shader_nodes(
     nodes,
     links,
@@ -1889,6 +1952,12 @@ def rebuild_texture_material(material):
             height_channel_socket,
             max(200.0, total_graph_count * 760.0 + 100.0),
         )
+        create_weight_bake_output_node(
+            nodes,
+            links,
+            height_channel_socket,
+            max(200.0, total_graph_count * 760.0 + 100.0),
+        )
 
         (
             roughness_socket,
@@ -1948,6 +2017,156 @@ def tm_initialize_height_paint_image(image):
     total_pixels = image.size[0] * image.size[1]
     image.pixels.foreach_set(array('f', [1.0, 1.0, 1.0, 0.0]) * total_pixels)
     image.update()
+
+
+def tm_initialize_height_mask_image(image):
+    """Create an opaque black mask that can be painted or blended directly."""
+    image.colorspace_settings.name = 'Non-Color'
+    image.pixels.foreach_set(array('f', [0.0, 0.0, 0.0, 1.0]) * (
+        image.size[0] * image.size[1]
+    ))
+    image.update()
+
+
+def tm_project_height_from_high_poly(context, low_poly, high_poly, layer, image):
+    """Project signed high-poly depth onto the low-poly UVs as a height map."""
+    depsgraph = context.evaluated_depsgraph_get()
+    low_evaluated = low_poly.evaluated_get(depsgraph)
+    high_evaluated = high_poly.evaluated_get(depsgraph)
+    low_mesh = high_mesh = None
+    try:
+        low_mesh = low_evaluated.to_mesh(
+            preserve_all_data_layers=True, depsgraph=depsgraph,
+        )
+        high_mesh = high_evaluated.to_mesh(
+            preserve_all_data_layers=True, depsgraph=depsgraph,
+        )
+        if low_mesh is None or high_mesh is None:
+            raise RuntimeError("Could not evaluate the low-poly or high-poly mesh")
+        uv_layer = low_mesh.uv_layers.get(layer.uv_map)
+        if uv_layer is None:
+            raise RuntimeError("The evaluated low-poly mesh is missing the bake UV map")
+        low_mesh.calc_loop_triangles()
+        high_mesh.calc_loop_triangles()
+        if not low_mesh.loop_triangles or not high_mesh.loop_triangles:
+            raise RuntimeError("The low-poly and high-poly meshes need faces")
+
+        low_world = [low_evaluated.matrix_world @ vertex.co for vertex in low_mesh.vertices]
+        high_world = [high_evaluated.matrix_world @ vertex.co for vertex in high_mesh.vertices]
+        high_bvh = BVHTree.FromPolygons(
+            high_world,
+            [tuple(triangle.vertices) for triangle in high_mesh.loop_triangles],
+            all_triangles=True,
+        )
+        # Zero matches Blender's selected-to-active convention: no ray limit.
+        ray_distance = layer.bake_max_ray_distance
+        low_bounds_min = Vector(tuple(min(point[axis] for point in low_world) for axis in range(3)))
+        low_bounds_max = Vector(tuple(max(point[axis] for point in low_world) for axis in range(3)))
+        epsilon = max(0.0000001, (low_bounds_max - low_bounds_min).length * 0.0000001)
+        normal_matrix = low_evaluated.matrix_world.to_3x3().inverted().transposed()
+        width, height = image.size
+        pixel_count = width * height
+        pixels = array('f', [0.0, 0.0, 0.0, 1.0]) * pixel_count
+        signed_depth = array('f', [0.0]) * pixel_count
+        hit_coverage = bytearray(pixel_count)
+
+        for triangle in low_mesh.loop_triangles:
+            uv = [uv_layer.data[index].uv.copy() for index in triangle.loops]
+            denominator = (
+                (uv[1].y - uv[2].y) * (uv[0].x - uv[2].x)
+                + (uv[2].x - uv[1].x) * (uv[0].y - uv[2].y)
+            )
+            if abs(denominator) < 0.00000001:
+                continue
+            corners = [low_world[index] for index in triangle.vertices]
+            face_normal = (corners[1] - corners[0]).cross(corners[2] - corners[0]).normalized()
+            if low_mesh.polygons[triangle.polygon_index].use_smooth:
+                normals = [
+                    (normal_matrix @ low_mesh.corner_normals[index].vector).normalized()
+                    for index in triangle.loops
+                ]
+            else:
+                normals = [face_normal] * 3
+            minimum_x = max(0, int(math.floor(min(point.x for point in uv) * width)))
+            maximum_x = min(width - 1, int(math.ceil(max(point.x for point in uv) * width)))
+            minimum_y = max(0, int(math.floor(min(point.y for point in uv) * height)))
+            maximum_y = min(height - 1, int(math.ceil(max(point.y for point in uv) * height)))
+            for y in range(minimum_y, maximum_y + 1):
+                uv_y = (y + 0.5) / height
+                for x in range(minimum_x, maximum_x + 1):
+                    uv_x = (x + 0.5) / width
+                    first = (
+                        (uv[1].y - uv[2].y) * (uv_x - uv[2].x)
+                        + (uv[2].x - uv[1].x) * (uv_y - uv[2].y)
+                    ) / denominator
+                    second = (
+                        (uv[2].y - uv[0].y) * (uv_x - uv[2].x)
+                        + (uv[0].x - uv[2].x) * (uv_y - uv[2].y)
+                    ) / denominator
+                    third = 1.0 - first - second
+                    if min(first, second, third) < -0.00001:
+                        continue
+                    position = corners[0] * first + corners[1] * second + corners[2] * third
+                    normal = (
+                        normals[0] * first + normals[1] * second + normals[2] * third
+                    ).normalized()
+                    if normal.length_squared < 0.00000001:
+                        normal = face_normal
+                    if ray_distance:
+                        raised = high_bvh.ray_cast(
+                            position + normal * epsilon, normal, ray_distance,
+                        )
+                        recessed = high_bvh.ray_cast(
+                            position - normal * epsilon, -normal, ray_distance,
+                        )
+                    else:
+                        raised = high_bvh.ray_cast(
+                            position + normal * epsilon, normal,
+                        )
+                        recessed = high_bvh.ray_cast(
+                            position - normal * epsilon, -normal,
+                        )
+                    raised_distance = raised[3] if raised[0] is not None else None
+                    recessed_distance = recessed[3] if recessed[0] is not None else None
+                    index = y * width + x
+                    if raised_distance is not None and (
+                        recessed_distance is None or raised_distance <= recessed_distance
+                    ):
+                        signed_depth[index] = raised_distance + epsilon
+                        hit_coverage[index] = 1
+                    elif recessed_distance is not None:
+                        signed_depth[index] = -(recessed_distance + epsilon)
+                        hit_coverage[index] = 1
+
+        # Normalize the reached high-poly surface, not the distance between the
+        # two objects. A source entirely below the target plane still has a
+        # white high point and a black low point.
+        minimum = math.inf
+        maximum = -math.inf
+        for index, covered in enumerate(hit_coverage):
+            if covered:
+                minimum = min(minimum, signed_depth[index])
+                maximum = max(maximum, signed_depth[index])
+        if minimum != math.inf:
+            height_range = maximum - minimum
+            for index, covered in enumerate(hit_coverage):
+                if not covered:
+                    continue
+                value = (
+                    (signed_depth[index] - minimum) / height_range
+                    if height_range > 0.0000001 else 1.0
+                )
+                offset = index * 4
+                pixels[offset] = value
+                pixels[offset + 1] = value
+                pixels[offset + 2] = value
+        image.pixels.foreach_set(pixels)
+        image.update()
+    finally:
+        if low_mesh is not None:
+            low_evaluated.to_mesh_clear()
+        if high_mesh is not None:
+            high_evaluated.to_mesh_clear()
 
 
 def tm_clip_uv_line(x1, y1, x2, y2):
@@ -3672,6 +3891,13 @@ def restore_shadow_visibility(values):
 def ensure_layer_image(material, layer, resolution):
     if layer.image:
         layer.image.use_fake_user = True
+        if (
+            layer.layer_type == 'HEIGHT'
+            and layer.image.colorspace_settings.name != 'Non-Color'
+        ):
+            if layer.image.is_dirty:
+                layer.image.pack()
+            layer.image.colorspace_settings.name = 'Non-Color'
         return layer.image
 
     image = bpy.data.images.new(
@@ -3682,16 +3908,18 @@ def ensure_layer_image(material, layer, resolution):
     )
     image.use_fake_user = True
     image.generated_color = (0.0, 0.0, 0.0, 0.0)
-    if layer.blend_mode != 'HEIGHT' and layer.layer_type in {
-        'AO',
-        'NORMAL',
-        'SHADOW',
-        'HARD_SHADOW',
-        'TOON',
-        'SHARP_EDGES',
-        'CURVATURE',
-        'LINEART',
-    }:
+    if layer.layer_type == 'HEIGHT' or (
+        layer.blend_mode != 'HEIGHT' and layer.layer_type in {
+            'AO',
+            'NORMAL',
+            'SHADOW',
+            'HARD_SHADOW',
+            'TOON',
+            'SHARP_EDGES',
+            'CURVATURE',
+            'LINEART',
+        }
+    ):
         try:
             image.colorspace_settings.name = 'Non-Color'
         except Exception:
@@ -3936,6 +4164,11 @@ def tm_data_channel_source(material, channel):
         if node:
             return node.outputs[0], 0.5
         return None, 0.5
+    elif channel == 'WEIGHT':
+        node = material.node_tree.nodes.get("TM Weight Bake Output")
+        if node:
+            return node.outputs[0], 0.0
+        return None, 0.0
     else:
         raise RuntimeError(f"Unsupported data bake channel: {channel}")
 
@@ -4310,7 +4543,6 @@ def rebuild_object_output_material(material, images, uv_map):
         bump = nodes.new("ShaderNodeBump")
         bump.name = "TM Baked Height"
         bump.location = (-80.0, -360.0)
-        bump.inputs["Midlevel"].default_value = 0.5
         links.new(height.outputs["Color"], bump.inputs["Height"])
         normal_output = bump.outputs["Normal"]
     if normal_output is not None:
@@ -4355,7 +4587,7 @@ class TM_Layer(bpy.types.PropertyGroup):
         name="Layer Type",
         items=TM_LAYER_TYPE_ITEMS,
         default='ALBEDO',
-        update=update_material_from_layer,
+        update=update_layer_type,
     )
     image: bpy.props.PointerProperty(
         name="Image",
@@ -4402,7 +4634,7 @@ class TM_Layer(bpy.types.PropertyGroup):
     )
     bake_max_ray_distance: bpy.props.FloatProperty(
         name="Max Ray Distance",
-        description="Maximum ray distance when baking without a cage",
+        description="Maximum projection distance; zero removes the distance limit",
         default=0.0,
         min=0.0,
         soft_max=1.0,
@@ -4860,6 +5092,11 @@ class TM_ObjectBakeSettings(bpy.types.PropertyGroup):
     bake_albedo: bpy.props.BoolProperty(name="Albedo", default=True)
     bake_normal: bpy.props.BoolProperty(name="Normal Map", default=True)
     bake_height: bpy.props.BoolProperty(name="Height", default=True)
+    bake_weight: bpy.props.BoolProperty(
+        name="Weight Map",
+        description="White for elevation; black for depth, neutral areas, and background",
+        default=False,
+    )
     bake_ao: bpy.props.BoolProperty(name="Ambient Occlusion", default=True)
     bake_roughness: bpy.props.BoolProperty(name="Roughness", default=True)
     bake_metalness: bpy.props.BoolProperty(name="Metalness", default=True)
@@ -4893,6 +5130,7 @@ class TM_ObjectBakeSettings(bpy.types.PropertyGroup):
     )
     output_normal_image: bpy.props.PointerProperty(type=bpy.types.Image)
     output_height_image: bpy.props.PointerProperty(type=bpy.types.Image)
+    output_weight_image: bpy.props.PointerProperty(type=bpy.types.Image)
     output_ao_image: bpy.props.PointerProperty(type=bpy.types.Image)
     output_roughness_image: bpy.props.PointerProperty(type=bpy.types.Image)
     output_metalness_image: bpy.props.PointerProperty(type=bpy.types.Image)
@@ -5240,10 +5478,9 @@ class TM_OT_bake_layer(bpy.types.Operator):
         layer = settings.layers[settings.layer_index]
         high_poly = (
             layer.high_poly_object
-            if (
-                tm_layer_supports_selected_to_active(layer)
-                and layer.blend_mode != 'HEIGHT'
-            )
+            if (layer.layer_type == 'HEIGHT'
+                or (layer.blend_mode != 'HEIGHT'
+                    and tm_layer_supports_selected_to_active(layer)))
             else None
         )
 
@@ -5292,11 +5529,14 @@ class TM_OT_bake_layer(bpy.types.Operator):
         if not uv_layer:
             uv_layer = obj.data.uv_layers.active
             layer.uv_map = uv_layer.name
+        uv_map_name = uv_layer.name
 
         image = ensure_layer_image(material, layer, settings.resolution)
         previous_engine = context.scene.render.engine
         previous_mode = obj.mode
-        previous_uv = obj.data.uv_layers.active
+        previous_uv_name = (
+            obj.data.uv_layers.active.name if obj.data.uv_layers.active else None
+        )
         previous_selected_objects = tuple(context.selected_objects)
         previous_active_object = context.view_layer.objects.active
         previous_samples = getattr(context.scene.cycles, "samples", None)
@@ -5324,8 +5564,9 @@ class TM_OT_bake_layer(bpy.types.Operator):
             if previous_mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
             tm_select_only_object(context, obj)
-            obj.data.uv_layers.active = uv_layer
-            uv_layer.active_render = True
+            selected_uv = obj.data.uv_layers[uv_map_name]
+            obj.data.uv_layers.active = selected_uv
+            selected_uv.active_render = True
             context.scene.render.engine = 'CYCLES'
             context.scene.cycles.samples = settings.samples
             bake.margin = settings.margin
@@ -5340,12 +5581,19 @@ class TM_OT_bake_layer(bpy.types.Operator):
             except Exception:
                 pass
 
-            if high_poly and layer.bake_match_vertex_groups:
+            if high_poly and layer.layer_type != 'HEIGHT' and layer.bake_match_vertex_groups:
                 group_bake_data = tm_prepare_vertex_group_bake(context, obj, high_poly, layer)
                 if not group_bake_data:
                     self.report({'WARNING'}, "No matching face regions; using the regular bake")
             alpha_coverage = None
-            if layer.blend_mode == 'HEIGHT':
+            if layer.layer_type == 'HEIGHT':
+                if high_poly:
+                    tm_project_height_from_high_poly(
+                        context, obj, high_poly, layer, image,
+                    )
+                else:
+                    tm_initialize_height_mask_image(image)
+            elif layer.blend_mode == 'HEIGHT':
                 tm_initialize_height_paint_image(image)
             else:
                 tm_clear_image(image)
@@ -5357,7 +5605,7 @@ class TM_OT_bake_layer(bpy.types.Operator):
                     layer,
                     image,
                 )
-            if layer.blend_mode == 'HEIGHT':
+            if layer.layer_type == 'HEIGHT' or layer.blend_mode == 'HEIGHT':
                 pass
             elif (
                 layer.layer_type == 'AO'
@@ -5482,8 +5730,8 @@ class TM_OT_bake_layer(bpy.types.Operator):
             if previous_samples is not None:
                 context.scene.cycles.samples = previous_samples
             context.scene.render.engine = previous_engine
-            if previous_uv:
-                obj.data.uv_layers.active = previous_uv
+            if previous_uv_name and previous_uv_name in obj.data.uv_layers:
+                obj.data.uv_layers.active = obj.data.uv_layers[previous_uv_name]
             tm_restore_object_selection(
                 context,
                 previous_selected_objects,
@@ -5499,7 +5747,7 @@ class TM_OT_bake_layer(bpy.types.Operator):
 class TM_OT_bake_object_albedo(bpy.types.Operator):
     bl_idname = "tm.bake_object_albedo"
     bl_label = "Bake"
-    bl_description = "Bake the object to one texture or selected material channels"
+    bl_description = "Bake all selected meshes into shared texture images"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -5509,38 +5757,52 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
     def execute(self, context):
         obj = context.object
         settings = obj.tm_bake_settings
+        objects = [
+            selected for selected in context.selected_objects
+            if selected.type == 'MESH'
+        ]
+        if obj not in objects:
+            objects.append(obj)
         if not obj.data.uv_layers:
-            self.report({'ERROR'}, "The object needs a UV map")
+            self.report({'ERROR'}, f"'{obj.name}' needs a UV map")
             return {'CANCELLED'}
 
         uv_layer = obj.data.uv_layers.get(settings.uv_map)
         if not uv_layer:
             uv_layer = obj.data.uv_layers.active
             settings.uv_map = uv_layer.name
+        uv_map_name = uv_layer.name
 
-        output_material = get_object_output_material(obj, settings)
-        for polygon in obj.data.polygons:
-            slot_index = polygon.material_index
-            if (
-                slot_index < len(obj.material_slots)
-                and obj.material_slots[slot_index].material == output_material
-            ):
+        for selected in objects:
+            if not selected.data.uv_layers.get(uv_map_name):
                 self.report(
                     {'ERROR'},
-                    "The baked material is assigned to source faces; restore the source materials first",
+                    f"'{selected.name}' needs a UV map named '{uv_map_name}'",
                 )
                 return {'CANCELLED'}
 
+        output_material = get_object_output_material(obj, settings)
+        source_materials_by_object = {}
         try:
-            source_materials = tm_object_used_materials(
-                obj,
-                excluded_materials={output_material},
-            )
+            for selected in objects:
+                for polygon in selected.data.polygons:
+                    slot_index = polygon.material_index
+                    if (
+                        slot_index < len(selected.material_slots)
+                        and selected.material_slots[slot_index].material == output_material
+                    ):
+                        raise RuntimeError(
+                            f"'{selected.name}' uses the baked material on source faces; "
+                            "restore its source materials first"
+                        )
+                source_materials = tm_object_used_materials(selected)
+                if not source_materials:
+                    raise RuntimeError(
+                        f"'{selected.name}' has no source materials to bake"
+                    )
+                source_materials_by_object[selected] = source_materials
         except RuntimeError as error:
             self.report({'ERROR'}, str(error))
-            return {'CANCELLED'}
-        if not source_materials:
-            self.report({'ERROR'}, "The object has no source materials to bake")
             return {'CANCELLED'}
 
         if settings.bake_mode == 'SINGLE':
@@ -5559,7 +5821,17 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
 
         previous_engine = context.scene.render.engine
         previous_mode = obj.mode
-        previous_uv = obj.data.uv_layers.active
+        previous_uvs = {
+            selected: (
+                selected.data.uv_layers.active.name
+                if selected.data.uv_layers.active else None,
+                next(
+                    (uv.name for uv in selected.data.uv_layers if uv.active_render),
+                    None,
+                ),
+            )
+            for selected in objects
+        }
         previous_active_material_index = obj.active_material_index
         previous_selected_objects = list(context.selected_objects)
         previous_active_object = context.view_layer.objects.active
@@ -5580,13 +5852,13 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
         try:
             if previous_mode != 'OBJECT':
                 bpy.ops.object.mode_set(mode='OBJECT')
-            tm_select_only_object(context, obj)
-            obj.data.uv_layers.active = uv_layer
-            uv_layer.active_render = True
+            for selected in objects:
+                selected_uv = selected.data.uv_layers[uv_map_name]
+                selected.data.uv_layers.active = selected_uv
+                selected_uv.active_render = True
             context.scene.render.engine = 'CYCLES'
             context.scene.cycles.samples = settings.samples
             bake.margin = settings.margin
-            bake.use_clear = True
             bake.use_selected_to_active = False
             try:
                 bake.target = 'IMAGE_TEXTURES'
@@ -5601,17 +5873,38 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
                     channel,
                 )
                 tm_clear_image(image)
-                try:
-                    if channel in {'ALBEDO', 'HEIGHT', 'METALNESS', 'ALPHA'}:
-                        override_records = tm_create_data_channel_bake_overrides(
-                            obj,
-                            image,
-                            channel,
-                            excluded_materials={output_material},
-                        )
-                        prepared_materials = {
-                            record[0] for record in override_records
-                        }
+                for object_index, selected in enumerate(objects):
+                    # Clear for the first mesh, then preserve its UV islands
+                    # while the remaining meshes write into the same image.
+                    bake.use_clear = object_index == 0
+                    source_materials = source_materials_by_object[selected]
+                    try:
+                        if channel in {'ALBEDO', 'HEIGHT', 'WEIGHT', 'METALNESS', 'ALPHA'}:
+                            override_records = tm_create_data_channel_bake_overrides(
+                                selected,
+                                image,
+                                channel,
+                                excluded_materials={output_material},
+                            )
+                            prepared_materials = {
+                                record[0] for record in override_records
+                            }
+                            bake_type = 'EMIT'
+                        else:
+                            temp_nodes, active_nodes = create_temp_bake_nodes(
+                                selected,
+                                image,
+                                excluded_materials={output_material},
+                            )
+                            prepared_materials = {
+                                material for material, _node in temp_nodes
+                            }
+                            bake_type = {
+                                'NORMAL': 'NORMAL',
+                                'AO': 'AO',
+                                'ROUGHNESS': 'ROUGHNESS',
+                                'EMISSION': 'EMIT',
+                            }[channel]
                         if any(
                             material not in prepared_materials
                             for material in source_materials
@@ -5619,56 +5912,47 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
                             raise RuntimeError(
                                 "Every source material must use nodes before it can be baked"
                             )
-                        bake_type = 'EMIT'
-                    else:
-                        temp_nodes, active_nodes = create_temp_bake_nodes(
-                            obj,
-                            image,
-                            excluded_materials={output_material},
-                        )
-                        prepared_materials = {
-                            material for material, _node in temp_nodes
-                        }
-                        if any(
-                            material not in prepared_materials
-                            for material in source_materials
-                        ):
-                            raise RuntimeError(
-                                "Every source material must use nodes before it can be baked"
-                            )
-                        bake_type = {
-                            'NORMAL': 'NORMAL',
-                            'AO': 'AO',
-                            'ROUGHNESS': 'ROUGHNESS',
-                            'EMISSION': 'EMIT',
-                        }[channel]
 
-                    bake.use_pass_direct = False
-                    bake.use_pass_indirect = False
-                    bake.use_pass_color = False
-                    if channel == 'NORMAL':
-                        try:
-                            bake.normal_space = 'TANGENT'
-                        except Exception:
-                            pass
-                    bpy.ops.object.bake(
-                        type=bake_type,
-                        uv_layer=settings.uv_map,
-                    )
-                    image.pack()
-                    images[channel] = image
-                finally:
-                    remove_temp_bake_nodes(temp_nodes, active_nodes)
-                    temp_nodes = []
-                    active_nodes = {}
-                    tm_remove_alpha_bake_overrides(override_records)
-                    override_records = []
+                        bake.use_pass_direct = False
+                        bake.use_pass_indirect = False
+                        bake.use_pass_color = False
+                        if channel == 'NORMAL':
+                            try:
+                                bake.normal_space = 'TANGENT'
+                            except Exception:
+                                pass
+                        tm_select_only_object(context, selected)
+                        result = bpy.ops.object.bake(
+                            type=bake_type,
+                            uv_layer=uv_map_name,
+                        )
+                        if 'FINISHED' not in result:
+                            raise RuntimeError(f"Bake failed for '{selected.name}'")
+                    finally:
+                        remove_temp_bake_nodes(temp_nodes, active_nodes)
+                        temp_nodes = []
+                        active_nodes = {}
+                        tm_remove_alpha_bake_overrides(override_records)
+                        override_records = []
+                image.pack()
+                images[channel] = image
 
             rebuild_object_output_material(
                 output_material,
                 images,
-                uv_layer.name,
+                uv_map_name,
             )
+            for selected in objects:
+                selected_settings = selected.tm_bake_settings
+                selected_settings.output_material = output_material
+                selected_settings.material_name = output_material.name
+                selected_settings.uv_map = uv_map_name
+                for channel in channels:
+                    image_property = next(
+                        data[3] for data in TM_OBJECT_BAKE_CHANNELS
+                        if data[0] == channel
+                    )
+                    setattr(selected_settings, image_property, images[channel])
             channel_labels = ", ".join(
                 next(data[1] for data in TM_OBJECT_BAKE_CHANNELS if data[0] == channel)
                 for channel in channels
@@ -5676,7 +5960,7 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
             self.report(
                 {'INFO'},
                 (
-                    f"Baked '{obj.name}' from {len(source_materials)} material(s): "
+                    f"Baked {len(objects)} object(s) into shared images: "
                     f"{channel_labels}"
                 ),
             )
@@ -5693,13 +5977,18 @@ class TM_OT_bake_object_albedo(bpy.types.Operator):
             bake.use_pass_indirect = previous_bake["use_pass_indirect"]
             bake.use_pass_color = previous_bake["use_pass_color"]
             bake.use_selected_to_active = previous_bake["use_selected_to_active"]
+            bake.use_clear = previous_bake["use_clear"]
             if previous_samples is not None:
                 context.scene.cycles.samples = previous_samples
             context.scene.render.engine = previous_engine
             obj.active_material_index = previous_active_material_index
-            if previous_uv:
-                obj.data.uv_layers.active = previous_uv
-                previous_uv.active_render = True
+            for selected, (active_uv_name, render_uv_name) in previous_uvs.items():
+                if active_uv_name and active_uv_name in selected.data.uv_layers:
+                    selected.data.uv_layers.active = (
+                        selected.data.uv_layers[active_uv_name]
+                    )
+                if render_uv_name and render_uv_name in selected.data.uv_layers:
+                    selected.data.uv_layers[render_uv_name].active_render = True
             tm_restore_object_selection(
                 context,
                 previous_selected_objects,
@@ -5912,6 +6201,9 @@ class TM_PT_panel(bpy.types.Panel):
                     texture_box = selected_box.box()
                     texture_box.label(
                         text=(
+                            "Height Mask (Grayscale)"
+                            if layer.layer_type == 'HEIGHT'
+                            else
                             "Texture (RGB Color + Alpha Height)"
                             if layer.blend_mode == 'HEIGHT'
                             else "Texture"
@@ -5997,15 +6289,25 @@ class TM_PT_panel(bpy.types.Panel):
                     generation_box = selected_box.box()
                     generation_box.label(text="Generation", icon='RENDER_STILL')
 
-                    if layer.blend_mode == 'HEIGHT':
+                    if layer.layer_type == 'HEIGHT':
+                        generation_box.label(
+                            text=(
+                                "Generate projects high-poly height"
+                                if layer.high_poly_object
+                                else "Generate creates a black height mask"
+                            ),
+                            icon='MOD_DISPLACE',
+                        )
+                    elif layer.blend_mode == 'HEIGHT':
                         generation_box.label(
                             text="Generate creates a white paint canvas",
                             icon='BRUSH_DATA',
                         )
 
                     if (
-                        layer.blend_mode != 'HEIGHT'
-                        and tm_layer_supports_selected_to_active(layer)
+                        layer.layer_type == 'HEIGHT'
+                        or (layer.blend_mode != 'HEIGHT'
+                            and tm_layer_supports_selected_to_active(layer))
                     ):
                         generation_box.prop(
                             layer,
@@ -6014,27 +6316,28 @@ class TM_PT_panel(bpy.types.Panel):
                         )
                         if layer.high_poly_object:
                             projection_box = generation_box.box()
-                            projection_box.prop(layer, "bake_match_vertex_groups")
-                            projection_box.prop(
-                                layer,
-                                "bake_use_cage",
-                                text="Cage",
-                                toggle=True,
-                            )
-                            if layer.bake_use_cage:
+                            if layer.layer_type != 'HEIGHT':
+                                projection_box.prop(layer, "bake_match_vertex_groups")
                                 projection_box.prop(
                                     layer,
-                                    "bake_cage_object",
+                                    "bake_use_cage",
+                                    text="Cage",
+                                    toggle=True,
                                 )
-                            extrusion_row = projection_box.row()
-                            extrusion_row.enabled = not (
-                                layer.bake_use_cage
-                                and layer.bake_cage_object is not None
-                            )
-                            extrusion_row.prop(
-                                layer,
-                                "bake_cage_extrusion",
-                            )
+                                if layer.bake_use_cage:
+                                    projection_box.prop(
+                                        layer,
+                                        "bake_cage_object",
+                                    )
+                                extrusion_row = projection_box.row()
+                                extrusion_row.enabled = not (
+                                    layer.bake_use_cage
+                                    and layer.bake_cage_object is not None
+                                )
+                                extrusion_row.prop(
+                                    layer,
+                                    "bake_cage_extrusion",
+                                )
                             projection_box.prop(
                                 layer,
                                 "bake_max_ray_distance",
